@@ -1,0 +1,92 @@
+name: Guardrails
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CONFTEST_VERSION: "0.71.0"
+  CONFTEST_SHA256: "765dfefdf0730693d7541ea0147e10d530a54ed257bbfec055ff34c837ffdf72"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Test the rules themselves: are they well-formed, and do they catch what
+  # they claim to catch?
+  # ---------------------------------------------------------------------------
+  test-policies:
+    name: Test the rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Conftest (pinned and checksum-verified)
+        run: |
+          file="conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+          curl --silent --show-error --fail --location --output "$file" \
+            "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/${file}"
+          echo "${CONFTEST_SHA256}  ${file}" | sha256sum --check
+          tar --extract --gzip --file "$file" conftest
+          sudo mv conftest /usr/local/bin/conftest
+          conftest --version
+
+      - name: Check formatting
+        run: conftest fmt --check policy
+
+      - name: Unit tests
+        run: conftest verify --policy policy
+
+      - name: End-to-end check on the example environments
+        run: ./scripts/check-examples.sh
+
+      - name: Show what the rules report on the insecure example
+        run: |
+          {
+            echo "### Findings on \`examples/insecure\`"
+            echo '```'
+            conftest test --parser hcl2 --policy policy --no-color examples/insecure/main.tf || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Use the rules for real: scan my own Terraform project with them.
+  # ---------------------------------------------------------------------------
+  scan-real-project:
+    name: Scan my Terraform project
+    needs: test-policies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the Terraform project
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/azure-secure-webapp-terraform
+          path: target
+
+      - name: Install Conftest (pinned and checksum-verified)
+        run: |
+          file="conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+          curl --silent --show-error --fail --location --output "$file" \
+            "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/${file}"
+          echo "${CONFTEST_SHA256}  ${file}" | sha256sum --check
+          tar --extract --gzip --file "$file" conftest
+          sudo mv conftest /usr/local/bin/conftest
+
+      - name: Scan
+        run: |
+          mapfile -t files < <(find target -name '*.tf' -not -path '*/.terraform/*' | sort)
+          echo "Scanning ${#files[@]} Terraform files"
+          conftest test --parser hcl2 --policy policy --no-color "${files[@]}" | tee result.txt
+
+          {
+            echo "### Scan of \`azure-secure-webapp-terraform\`"
+            echo '```'
+            tail -n 5 result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
